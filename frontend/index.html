@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Anna — Je Virtuele Stijlist (LIVE)</title>
+  <meta name="description" content="Anna: Slim stylen. Nuchter advies. Meteen bestelbaar. Altijd live via SerpAPI.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand">
+      <div class="avatar" aria-hidden="true">A</div>
+      <div>
+        <h1>Anna</h1>
+        <p class="tagline">Slim stylen. Nuchter advies. Meteen bestelbaar.</p>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="settingsBtn" class="ghost" aria-haspopup="dialog" aria-controls="settingsModal">Instellingen</button>
+    </div>
+  </header>
+
+  <main class="container">
+    <section id="chat" class="chat" aria-live="polite">
+      <div class="bubble anna">
+        <p><strong>Hoi, ik ben Anna</strong> 👋. We doen dit stap voor stap — <em>één vraag per bericht</em>.<br>
+        Eerst even algemeen: noem je <strong>geslacht</strong>, <strong>leeftijd</strong>, <strong>lengte</strong>, <strong>land/regio</strong> (bv. NL) en (optioneel) je <strong>maten</strong> (bv. boven L, broek 50, schoen 43).</p>
+      </div>
+    </section>
+
+    <form id="inputForm" class="input-row" autocomplete="off" aria-label="Chat invoer">
+      <input id="userInput" type="text" placeholder="Typ je antwoord…" aria-label="Jouw antwoord">
+      <button type="submit" aria-label="Verstuur bericht">Stuur</button>
+    </form>
+  </main>
+
+  <!-- Instellingen (client-side) -->
+  <div id="settingsModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <div class="modal-card">
+      <h2 id="settingsTitle">Instellingen</h2>
+
+      <label class="stack">
+        <span>Back-end API URL</span>
+        <input id="apiBase" type="url" placeholder="https://jouw-backend.onrender.com" value="http://localhost:8000" aria-describedby="apiBaseHelp">
+      </label>
+      <p id="apiBaseHelp" class="small">Het adres van de server (Render of lokaal).</p>
+
+      <div class="modal-actions">
+        <button id="saveSettings">Opslaan</button>
+        <button id="closeSettings" class="ghost">Sluiten</button>
+      </div>
+      <p class="small">Anna draait altijd <strong>live via SerpAPI</strong>. De sleutel staat veilig op de server.</p>
+    </div>
+  </div>
+
+  <!-- Template voor chat-bubbles -->
+  <template id="bubbleTemplate">
+    <div class="bubble">
+      <p></p>
+    </div>
+  </template>
+
+  <script src="app.js"></script>
+</body>
+</html>
