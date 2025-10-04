@@ -4,21 +4,21 @@ import urllib.parse
 import requests
 from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 # pydantic v1/v2 compat
 try:
-    from pydantic import BaseModel, Field, ConfigDict  # v2
+    from pydantic import BaseModel, Field, ConfigDict, model_validator  # v2
     HAS_PYDANTIC_V2 = True
 except Exception:
-    from pydantic import BaseModel, Field                 # v1
+    from pydantic import BaseModel, Field, root_validator               # v1
     HAS_PYDANTIC_V2 = False
 
 from dotenv import load_dotenv
 load_dotenv()
 
-app = FastAPI(title="Anna MVP API", version="0.3.4")
+app = FastAPI(title="Anna MVP API", version="0.3.5")
 
 # CORS – open voor MVP
 app.add_middleware(
@@ -34,6 +34,7 @@ app.add_middleware(
 class Intake(BaseModel):
     purpose: str = Field(..., description="werk, vrije tijd, event, dagelijks, etc.")
     styles: Optional[List[str]] = Field(None, description="max 2 stijlen (casual, klassiek, sportief, creatief, minimalistisch)")
+    # Let op: we willen 'gender' als man/vrouw, maar accepteren ook 'geslacht' uit de frontend.
     gender: Optional[str] = Field(None, description="man of vrouw")
     fit: Optional[str] = None
     age_range: Optional[str] = None
@@ -47,12 +48,47 @@ class Intake(BaseModel):
     accessibility: Optional[Dict[str, Any]] = None
     sustainability_preference: Optional[bool] = False
 
-    # Negeer extra velden; frontend mag meer sturen (bv. 'geslacht')
     if HAS_PYDANTIC_V2:
-        model_config = ConfigDict(extra="ignore")
+        # v2: negeer extra velden en laat populatie op naam toe
+        model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+        @model_validator(mode="before")
+        def map_geslacht_to_gender(cls, values):
+            """Zet 'geslacht' (man/vrouw) om naar 'gender' vóór validatie."""
+            if isinstance(values, dict):
+                data = dict(values)
+                if "gender" not in data and "geslacht" in data:
+                    data["gender"] = data.get("geslacht")
+                # normaliseer
+                g = str(data.get("gender") or "").strip().lower()
+                if g in {"male", "m"}:
+                    g = "man"
+                if g in {"female", "f"}:
+                    g = "vrouw"
+                if g:
+                    data["gender"] = g
+                return data
+            return values
     else:
+        # v1: negeer extra velden
         class Config:
             extra = "ignore"
+            allow_population_by_field_name = True
+
+        @root_validator(pre=True)
+        def map_geslacht_to_gender(cls, values):
+            """Zet 'geslacht' (man/vrouw) om naar 'gender' vóór validatie (pydantic v1)."""
+            if isinstance(values, dict):
+                if "gender" not in values and "geslacht" in values:
+                    values["gender"] = values.get("geslacht")
+                g = str(values.get("gender") or "").strip().lower()
+                if g in {"male", "m"}:
+                    g = "man"
+                if g in {"female", "f"}:
+                    g = "vrouw"
+                if g:
+                    values["gender"] = g
+            return values
 
 
 class GenerateRequest(BaseModel):
@@ -66,7 +102,7 @@ def meta():
     return {
         "has_serpapi": bool(os.getenv("SERPAPI_API_KEY", "")),
         "environment": "dev",
-        "version": "0.3.4",
+        "version": "0.3.5",
     }
 
 # --------------------- Hulpfuncties (SerpAPI) ---------------------
@@ -98,7 +134,7 @@ def _gender_token(g: Optional[str]) -> str:
 def _build_query(category: str, intake: Dict[str, Any]) -> str:
     styles = " ".join((intake.get("styles") or ["casual"])[:2])
     colors = " ".join(intake.get("favorite_colors") or [])
-    gender = _gender_token(intake.get("gender") or intake.get("geslacht"))
+    gender = _gender_token(intake.get("gender"))
 
     terms = {
         "outer": "jacket blazer overshirt coat",
@@ -147,7 +183,6 @@ def _price_of(x: dict) -> float:
         return 0.0
 
 def _pick_item_with_direct(results: list, max_price: float):
-    # Probeer dicht bij max_price met directe link
     ordered = sorted(results, key=lambda x: abs(_price_of(x) - max_price))
     for r in ordered:
         link = _first_direct_link(r)
@@ -155,7 +190,6 @@ def _pick_item_with_direct(results: list, max_price: float):
         if link and 0 < price <= max_price * 1.10:
             return r, link, price
 
-    # Fallback: goedkoopste met directe link
     direct = [(r, _first_direct_link(r), _price_of(r)) for r in results]
     direct = [t for t in direct if t[1] and t[2] > 0]
     if not direct:
@@ -235,26 +269,13 @@ def generate_with_serpapi(intake: Dict[str, Any], api_key: str, outfits_count: i
 # --------------------- Endpoint ---------------------
 
 @app.post("/api/generate")
-async def generate(req: GenerateRequest, request: Request):
-    # Haal ruwe body op om 'geslacht' te kunnen lezen als de frontend dat zo noemt
-    try:
-        raw = await request.json()
-    except Exception:
-        raw = {}
-    raw_intake = (raw or {}).get("intake", {}) or {}
-
-    # Bouw intake dict en merge 'geslacht' -> 'gender' indien nodig
-    intake_dict = req.intake.dict()
-    if not intake_dict.get("gender"):
-        g = (raw_intake.get("gender") or raw_intake.get("geslacht") or "").strip()
-        if g:
-            intake_dict["gender"] = g
-
+def generate(req: GenerateRequest):
     api_key = os.getenv("SERPAPI_API_KEY", "").strip()
     if not api_key:
         raise HTTPException(status_code=500, detail="SERPAPI_API_KEY ontbreekt")
 
     try:
+        intake_dict = req.intake.dict()
         return generate_with_serpapi(intake_dict, api_key, req.outfits_count)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
