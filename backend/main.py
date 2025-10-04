@@ -1,153 +1,119 @@
-import os, re, urllib.parse, requests
+import os
+import re
+import urllib.parse
+import requests
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, HTTPException
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+
+# pydantic v1/v2 compat
+try:
+    from pydantic import BaseModel, Field, ConfigDict  # v2
+    HAS_PYDANTIC_V2 = True
+except Exception:
+    from pydantic import BaseModel, Field                 # v1
+    HAS_PYDANTIC_V2 = False
+
 from dotenv import load_dotenv
-
-# Chat (GPT-4o) – verwacht backend/llm.py en backend/prompts/anna_system_nl.md
-from llm import chat_anna
-
 load_dotenv()
 
-app = FastAPI(title="Anna Reboot API", version="0.3.1")
+app = FastAPI(title="Anna MVP API", version="0.3.4")
 
-# ----------------------------- CORS ---------------------------------
+# CORS – open voor MVP
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # MVP: open. Later beperken naar je Netlify-domein.
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -------------------------- Pydantic models -------------------------
+# --------------------- Datamodellen ---------------------
+
 class Intake(BaseModel):
     purpose: str = Field(..., description="werk, vrije tijd, event, dagelijks, etc.")
-    styles: List[str] = Field(default_factory=list, description="max 2 stijlen: minimalistisch, casual, klassiek, sportief, creatief")
-    gender: str = Field("unisex", description="male/female/unisex/non-binary")
-    fit: Optional[str] = Field(None, description="recht, getailleerd, relaxed")
-    age_range: Optional[str] = Field(None, description="18–25, 26–35, 36–45, 46–55, 56+")
-    country: str = Field("NL", description="NL, BE, DE, FR, UK, US, etc.")
-    currency: Optional[str] = Field(None, description="EUR, GBP, USD (optioneel, afgeleid van land)")
-    budget_total: Optional[float] = Field(250, description="Totaalbudget (bijv. 250)")
-    budget_per_item: Optional[float] = Field(None, description="Budget per item (optioneel)")
-    sizes: Optional[Dict[str, str]] = Field(None, description="maat per categorie (optioneel)")
-    favorite_colors: Optional[List[str]] = Field(default_factory=list, description="voorkeurskleuren (0–3)")
-    materials_avoid: Optional[List[str]] = Field(default_factory=list, description="materialen/allergieën (optioneel)")
-    accessibility: Optional[Dict[str, Any]] = Field(default_factory=dict, description="toegankelijkheidswensen (optioneel)")
-    sustainability_preference: Optional[bool] = Field(False, description="zacht criterium: bij voorkeur duurzaam")
+    styles: Optional[List[str]] = Field(None, description="max 2 stijlen (casual, klassiek, sportief, creatief, minimalistisch)")
+    gender: Optional[str] = Field(None, description="man of vrouw")
+    fit: Optional[str] = None
+    age_range: Optional[str] = None
+    country: Optional[str] = Field("NL", description="NL, BE, DE, FR, UK, US")
+    currency: Optional[str] = None
+    budget_total: Optional[float] = Field(250, ge=0, description="Totaalbudget")
+    budget_per_item: Optional[float] = None
+    sizes: Optional[Dict[str, str]] = None
+    favorite_colors: Optional[List[str]] = None
+    materials_avoid: Optional[List[str]] = None
+    accessibility: Optional[Dict[str, Any]] = None
+    sustainability_preference: Optional[bool] = False
+
+    # Negeer extra velden; frontend mag meer sturen (bv. 'geslacht')
+    if HAS_PYDANTIC_V2:
+        model_config = ConfigDict(extra="ignore")
+    else:
+        class Config:
+            extra = "ignore"
+
 
 class GenerateRequest(BaseModel):
     intake: Intake
-    outfits_count: int = Field(3, description="aantal outfits (default 3)")
+    outfits_count: int = Field(3, ge=1, le=6, description="aantal outfits (1–6)")
 
-class ChatReq(BaseModel):
-    history: List[Dict[str, str]] = []
-    user_message: str
-    intake: Optional[Dict[str, Any]] = None  # optioneel; later handig
+# --------------------- Meta ---------------------
 
-# --------------------------- Utilities ------------------------------
+@app.get("/api/meta")
+def meta():
+    return {
+        "has_serpapi": bool(os.getenv("SERPAPI_API_KEY", "")),
+        "environment": "dev",
+        "version": "0.3.4",
+    }
 
-_STRIP_QUERY_KEYS = {
-    "utm_source","utm_medium","utm_campaign","utm_term","utm_content","utm_id",
-    "gclid","fbclid","mc_eid","mc_cid","_ga","_gl","aff","aff_id","campaign",
-}
+# --------------------- Hulpfuncties (SerpAPI) ---------------------
 
-_GOOGLE_HOSTS = {"www.google.com", "google.com", "www.google.nl", "google.nl"}
-
-def strip_tracking(url: str) -> str:
-    """Verwijder standaard tracking-parameters (utm/gclid/etc.)."""
-    try:
-        parsed = urllib.parse.urlsplit(url)
-        if not parsed.query:
-            return url
-        q = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-        kept = [(k, v) for (k, v) in q if k.lower() not in _STRIP_QUERY_KEYS]
-        new_query = urllib.parse.urlencode(kept, doseq=True)
-        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment))
-    except Exception:
-        return url
-
-def is_google_product_link(url: str) -> bool:
-    try:
-        host = urllib.parse.urlsplit(url).netloc.lower()
-        path = urllib.parse.urlsplit(url).path
-        return (host in _GOOGLE_HOSTS) and (path.startswith("/shopping/product") or path.startswith("/aclk") or path.startswith("/url"))
-    except Exception:
-        return False
-
-def prefer_direct_link(result: Dict[str, Any]) -> Optional[str]:
-    """
-    Kies de directe merchant-link:
-    - 'product_link' heeft voorkeur
-    - anders 'link', mits het GEEN Google-productpagina is
-    """
-    link = result.get("product_link") or result.get("product") or None
-    if link and not is_google_product_link(link):
-        return strip_tracking(link)
-
-    link = result.get("link")
-    if link and not is_google_product_link(link):
-        return strip_tracking(link)
-
-    # Probeer soms 'source' of 'seller' domain + 'product_id' (niet gegarandeerd aanwezig)
-    # Als alles faalt: None (later vullen we een nette fallback in de output)
-    return None
-
-def display_domain(url: str) -> str:
-    try:
-        host = urllib.parse.urlsplit(url).netloc.lower()
-        # Tover nette domeinstring, bv. shop.mango.com/nl -> Mango.com/nl
-        parts = host.split(".")
-        if len(parts) >= 2:
-            host = f"{parts[-2]}.{parts[-1]}"
-        # NL/BE pad hint
-        path = urllib.parse.urlsplit(url).path
-        if path:
-            path_lower = path.lower()
-            if "/nl" in path_lower:
-                return f"{host}/nl"
-            if "/be" in path_lower:
-                return f"{host}/be"
-        return host
-    except Exception:
-        return ""
-
-def alloc_budget(total: float) -> Dict[str, float]:
-    """Verdeel budget over categorieën; som ≈ total (kleine afronding)."""
-    total = float(total or 250)
+def _alloc(budget: float) -> Dict[str, float]:
     alloc = {
-        "outer": total * 0.25,
-        "top1": total * 0.15,
-        "top2": total * 0.15,
-        "bottom": total * 0.20,
-        "shoes": total * 0.20,
-        "tee": total * 0.04,
-        "accessory": total * 0.01,
+        "outer": budget * 0.25,
+        "top1": budget * 0.15,
+        "top2": budget * 0.15,
+        "bottom": budget * 0.20,
+        "shoes": budget * 0.20,
+        "tee": budget * 0.04,
+        "accessory": budget * 0.01,
     }
     alloc["_total"] = sum(v for k, v in alloc.items() if k != "_total")
     return alloc
 
-_CATEGORY_TERMS = {
-    "outer": "jacket blazer overshirt coat",
-    "top1": "shirt knit sweater",
-    "top2": "shirt knit sweater",
-    "tee": "t-shirt tee",
-    "bottom": "chino trousers jeans",
-    "shoes": "sneakers shoes",
-    "accessory": "belt scarf",
-}
+def _gender_token(g: Optional[str]) -> str:
+    """Converteer man/vrouw (of tolerant: male/female, m/v) naar 'men' of 'women'."""
+    if not g:
+        return ""
+    g = str(g).strip().lower()
+    if g in {"man", "male", "m"}:
+        return "men"
+    if g in {"vrouw", "female", "v"}:
+        return "women"
+    return ""
 
-def build_query(category: str, intake: Dict[str, Any]) -> str:
-    gender_raw = (intake.get("gender") or "unisex").lower()
-    gender = {"male": "men", "female": "women"}.get(gender_raw, "unisex")
-    styles = " ".join((intake.get("styles") or [])[:2])
-    colors = " ".join((intake.get("favorite_colors") or [])[:3])
-    terms = _CATEGORY_TERMS.get(category, "")
-    return " ".join(x for x in [gender, styles, terms, colors] if x).strip()
+def _build_query(category: str, intake: Dict[str, Any]) -> str:
+    styles = " ".join((intake.get("styles") or ["casual"])[:2])
+    colors = " ".join(intake.get("favorite_colors") or [])
+    gender = _gender_token(intake.get("gender") or intake.get("geslacht"))
 
-def serp_search(q: str, gl: str, api_key: str, num: int = 16) -> List[Dict[str, Any]]:
+    terms = {
+        "outer": "jacket blazer overshirt coat",
+        "top1": "shirt knit sweater",
+        "top2": "shirt knit sweater",
+        "tee": "t-shirt tee",
+        "bottom": "chino trousers jeans",
+        "shoes": "sneakers shoes",
+        "accessory": "belt scarf",
+    }[category]
+
+    parts = [gender, styles, terms, colors]
+    return " ".join(x for x in parts if x).strip()
+
+def _serp_search(q: str, gl: str, api_key: str, num: int = 20) -> list:
     url = "https://serpapi.com/search.json"
     params = {
         "engine": "google_shopping",
@@ -157,162 +123,144 @@ def serp_search(q: str, gl: str, api_key: str, num: int = 16) -> List[Dict[str, 
         "num": num,
         "api_key": api_key,
     }
-    r = requests.get(url, params=params, timeout=25)
+    r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
-    return r.json().get("shopping_results", []) or []
+    return r.json().get("shopping_results") or []
 
-def pick_item(results: List[Dict[str, Any]], max_price: float) -> Optional[Dict[str, Any]]:
-    """Kies het best passende item ≤ 110% van max_price; anders goedkoopste met prijs."""
-    best = None
-    for r in results:
-        price = r.get("extracted_price") or r.get("price") or 0
-        try:
-            price = float(price)
-        except Exception:
-            continue
-        if price <= max_price * 1.10:
-            if best is None:
-                best = r
-            else:
-                # dichter bij max_price is beter
-                prev = best.get("extracted_price") or best.get("price") or 0
-                try:
-                    prev = float(prev)
-                except Exception:
-                    prev = 0.0
-                if abs(price - max_price) < abs(prev - max_price):
-                    best = r
-    if best is None:
-        priced = []
-        for x in results:
-            p = x.get("extracted_price") or x.get("price")
-            try:
-                p = float(p)
-                priced.append((p, x))
-            except Exception:
-                pass
-        if priced:
-            priced.sort(key=lambda t: t[0])
-            best = priced[0][1]
-    return best
+def _is_direct(url: str) -> bool:
+    if not url:
+        return False
+    return "google." not in url.lower()
 
-def map_item(cat: str, r: Dict[str, Any]) -> Dict[str, Any]:
-    price = r.get("extracted_price") or r.get("price") or 0
+def _first_direct_link(r: dict) -> str:
+    for key in ("link", "product_link", "source_url", "source_link"):
+        url = (r.get(key) or "").strip()
+        if _is_direct(url):
+            return url
+    return ""
+
+def _price_of(x: dict) -> float:
+    p = x.get("extracted_price") or x.get("price")
     try:
-        price = float(price)
+        return float(p)
     except Exception:
-        price = 0.0
+        return 0.0
 
-    link = prefer_direct_link(r)
-    if not link:
-        # nette fallback i.p.v. Google "Nothing to see here"
-        link = "#"
+def _pick_item_with_direct(results: list, max_price: float):
+    # Probeer dicht bij max_price met directe link
+    ordered = sorted(results, key=lambda x: abs(_price_of(x) - max_price))
+    for r in ordered:
+        link = _first_direct_link(r)
+        price = _price_of(r)
+        if link and 0 < price <= max_price * 1.10:
+            return r, link, price
 
+    # Fallback: goedkoopste met directe link
+    direct = [(r, _first_direct_link(r), _price_of(r)) for r in results]
+    direct = [t for t in direct if t[1] and t[2] > 0]
+    if not direct:
+        return None, "", 0.0
+    direct.sort(key=lambda t: t[2])
+    return direct[0]
+
+def _map_item(category: str, r: dict, link: str, price: float) -> dict:
+    cur = r.get("currency") or "EUR"
     merchant = r.get("source") or r.get("seller") or ""
-    image = r.get("thumbnail") or r.get("image") or None
-
+    title = r.get("title") or "—"
+    img = r.get("thumbnail") or r.get("image")
     return {
-        "category": cat,
-        "title": r.get("title", "—"),
+        "category": category,
+        "title": title,
         "price": round(price, 2),
-        "currency": r.get("currency") or "EUR",
+        "currency": cur,
         "link": link,
-        "image": image,
-        "merchant": display_domain(link) if link and link != "#" else merchant,
+        "image": img,
+        "merchant": merchant,
         "cheaper_alternative": None,
     }
 
-# ------------------------------ Routes ------------------------------
+def generate_with_serpapi(intake: Dict[str, Any], api_key: str, outfits_count: int = 3) -> dict:
+    budget = float(intake.get("budget_total") or 250)
+    alloc = _alloc(budget)
+    gl = (intake.get("country") or "NL")[:2]
+    categories = ["outer", "top1", "top2", "bottom", "shoes", "tee", "accessory"]
+    palette = {"colors": (intake.get("favorite_colors") or ["navy", "white", "grey"])}
 
-@app.get("/api/meta")
-def meta():
-    key_env = os.getenv("SERPAPI_API_KEY", "")
+    outfits = []
+    cache: Dict[str, list] = {}
+
+    for i in range(max(1, min(outfits_count, 6))):
+        items = []
+        total = 0.0
+        for cat in categories:
+            q = _build_query(cat, intake)
+            if q not in cache:
+                cache[q] = _serp_search(q, gl, api_key, num=20)
+
+            r, link, price = _pick_item_with_direct(cache[q], alloc[cat])
+
+            if r:
+                item = _map_item(cat, r, link, price)
+            else:
+                item = {
+                    "category": cat,
+                    "title": "(geen directe shoplink gevonden — alternatief)",
+                    "price": round(alloc[cat], 2),
+                    "currency": "EUR",
+                    "link": "#",
+                    "image": None,
+                    "merchant": "—",
+                    "cheaper_alternative": None,
+                }
+            items.append(item)
+            total += float(item.get("price") or 0)
+
+        outfits.append({
+            "name": f"Outfit {i + 1}",
+            "items": items,
+            "total": round(total, 2),
+            "currency": items[0].get("currency", "EUR"),
+        })
+
     return {
-        "has_serpapi": bool(key_env),
-        "environment": "dev",
-        "version": "0.3.1"
+        "palette": palette,
+        "allocation": alloc,
+        "outfits": outfits,
+        "explanation": "Producten gezocht via Google Shopping (SerpAPI) met directe shop‑links. Bij lege resultaten kies ik een veilig alternatief.",
+        "independent_note": "Anna is onafhankelijk — geen affiliate; links zijn puur gemak.",
+        "country": intake.get("country") or "NL",
+        "currency": outfits[0].get("currency", "EUR"),
     }
 
+# --------------------- Endpoint ---------------------
+
 @app.post("/api/generate")
-def generate(req: GenerateRequest):
-    api_key = os.getenv("SERPAPI_API_KEY")
+async def generate(req: GenerateRequest, request: Request):
+    # Haal ruwe body op om 'geslacht' te kunnen lezen als de frontend dat zo noemt
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = {}
+    raw_intake = (raw or {}).get("intake", {}) or {}
+
+    # Bouw intake dict en merge 'geslacht' -> 'gender' indien nodig
+    intake_dict = req.intake.dict()
+    if not intake_dict.get("gender"):
+        g = (raw_intake.get("gender") or raw_intake.get("geslacht") or "").strip()
+        if g:
+            intake_dict["gender"] = g
+
+    api_key = os.getenv("SERPAPI_API_KEY", "").strip()
     if not api_key:
-        raise HTTPException(status_code=500, detail="SerpAPI key ontbreekt op de server.")
-
-    intake = req.intake.dict()
-    gl = (intake.get("country") or "NL")[:2].lower()
-    budget = float(intake.get("budget_total") or 250)
-    alloc = alloc_budget(budget)
-    categories = ["outer", "top1", "top2", "bottom", "shoes", "tee", "accessory"]
-
-    palette = {"colors": (intake.get("favorite_colors") or ["navy", "white", "grey", "black", "stone"])}
-
-    cache: Dict[str, List[Dict[str, Any]]] = {}
-    outfits = []
+        raise HTTPException(status_code=500, detail="SERPAPI_API_KEY ontbreekt")
 
     try:
-        for n in range(max(1, int(req.outfits_count))):
-            items = []
-            total = 0.0
-            for cat in categories:
-                q = build_query(cat, intake)
-                if q not in cache:
-                    cache[q] = serp_search(q, gl, api_key, num=16)
-                found = pick_item(cache[q], alloc[cat])
-                if found:
-                    item = map_item(cat, found)
-                else:
-                    # veilige fallback (zonder link)
-                    item = {
-                        "category": cat,
-                        "title": "(Geen resultaat gevonden — alternatief binnen budget)",
-                        "price": round(alloc[cat], 2),
-                        "currency": "EUR",
-                        "link": "#",
-                        "image": None,
-                        "merchant": "—",
-                        "cheaper_alternative": None,
-                    }
-                items.append(item)
-                try:
-                    total += float(item.get("price") or 0.0)
-                except Exception:
-                    pass
-
-            outfits.append({
-                "name": f"Outfit {n+1}",
-                "items": items,
-                "total": round(total, 2),
-                "currency": items[0].get("currency", "EUR") if items else "EUR",
-            })
-
-        return {
-            "palette": palette,
-            "allocation": alloc,
-            "outfits": outfits,
-            "explanation": "Producten gezocht via Google Shopping (SerpAPI) op jouw stijl, land en budget. Ik toon directe productlinks (geen Google-redirects).",
-            "independent_note": "Anna is onafhankelijk — geen affiliate; links zijn puur gemak.",
-            "country": intake.get("country") or "NL",
-            "currency": outfits[0].get("currency", "EUR") if outfits else "EUR",
-        }
-
-    except requests.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"SerpAPI error: {e}")
+        return generate_with_serpapi(intake_dict, api_key, req.outfits_count)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/chat")
-def api_chat(req: ChatReq):
-    """Kleine chat-endpoint voor de intake/gespreksflow met Anna (GPT-4o)."""
-    try:
-        reply = chat_anna(req.history, req.user_message)
-        return {"assistant_message": reply}
-    except Exception:
-        # veilige fallback tekst
-        return {"assistant_message": "Hm, er ging iets mis aan mijn kant. Kun je je laatste antwoord nog één keer sturen?"}
+# --------------------- Local run ---------------------
 
-# --------------------------- Local runner ---------------------------
 if __name__ == "__main__":
-    # Voor lokaal testen; op Render start je via het Start Command (gunicorn/uvicorn)
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
