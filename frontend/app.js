@@ -1,245 +1,401 @@
-/** Anna — Reboot MVP: 1 vraag per bericht, NL/BE, directe productlinks **/
+// Anna — empathisch & dynamisch intake-gesprek, gekoppeld aan jouw Render-backend (SerpAPI-only)
 
-const qs = (sel, el=document) => el.querySelector(sel);
-const BUBBLE = qs("#bubbleTemplate").content.firstElementChild;
+const qs = (s, el=document) => el.querySelector(s);
+const qsa = (s, el=document) => [...el.querySelectorAll(s)];
+const TPL = qs('#tplBubble').content.firstElementChild;
 
 const state = {
-  step: 1, // 1..6 intake
-  pendingConfirm: false,
-  apiBase: localStorage.getItem("apiBase") || "http://localhost:8000",
-  intake: {
-    purpose: "", styles: [], gender: "unisex", fit: "",
-    age_range: "", country: "NL", currency: "EUR",
-    budget_total: 250, budget_per_item: null,
-    sizes: {}, favorite_colors: [], materials_avoid: [],
-    accessibility: {}, sustainability_preference: false
+  step: -1,
+  answers: {
+    geslacht: null,          // "man" | "vrouw"
+    leeftijd: null,          // vrije tekst/nummer
+    lengte: null,            // cm (optioneel)
+    land: "NL",              // land/regio
+    maten: null,             // vrije tekst (optioneel)
+    gelegenheid: null,       // purpose
+    gevoel: null,            // gewenste vibe
+    voorkeuren: null,        // kleuren/materialen/silhouet
+    praktisch: null,         // eisen (mobiliteit, weer, onderhoud)
+    budget_total: 250,       // default
+    styles: [],              // afgeleid uit gevoel/voorkeuren
   },
-  notes: { occasion:"", feeling:"", prefs:"", practical:"", extra:"" },
+  apiBase: localStorage.getItem("apiBase") || "https://anna-reboot-backend.onrender.com",
+  history: []
 };
 
+// ---------- UI ----------
 function addBubble(html, who="anna"){
-  const b = BUBBLE.cloneNode(true);
-  b.classList.add(who);
+  const b = TPL.cloneNode(true);
+  b.classList.toggle("anna", who==="anna");
+  b.classList.toggle("user", who==="user");
   b.querySelector("p").innerHTML = html;
   qs("#chat").appendChild(b);
   b.scrollIntoView({behavior:"smooth", block:"end"});
 }
 function addUser(text){ addBubble(escapeHtml(text), "user"); }
-function escapeHtml(str){ return String(str).replace(/[&<>\"']/g, m => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[m])); }
+function clearChat(){ qs("#chat").innerHTML = ""; }
 
-function ask(){
-  const s = state.step;
-  if(state.pendingConfirm){ addBubble("Klinkt dit goed? Antwoord met <strong>ja</strong> of geef aan wat je wilt aanpassen."); return; }
-  switch(s){
-    case 1: addBubble("🔹 <strong>Algemeen</strong> — noem je <em>geslacht</em>, <em>leeftijd</em>, <em>lengte</em>, <em>land/regio</em> (bv. NL) en (optioneel) <em>maten</em> (bv. boven L, broek 50, schoen 43)."); break;
-    case 2: addBubble("🔹 <strong>Occasion</strong> — voor welke gelegenheid zoek je kledingadvies?"); break;
-    case 3: addBubble("🔹 <strong>Gevoel</strong> — hoe wil je dat je kleding je laat voelen?"); break;
-    case 4: addBubble("🔹 <strong>Voorkeuren</strong> — kleuren/materialen/silhouet die je fijn vindt of vermijdt."); break;
-    case 5: addBubble("🔹 <strong>Praktisch</strong> — leefstijl & eisen (mobiliteit, kreukarm, wasbaar, weer)."); break;
-    case 6: addBubble("🔹 <strong>Extra</strong> — budget per item/totaal en evt. pasvorm/dresscode."); break;
-    default: summarizeAndConfirm();
+function chipButtons(values){
+  return `<div class="chips">${values.map(v=>`<button class="chip btn chipbtn" data-val="${escapeHtml(v)}" style="cursor:pointer">${escapeHtml(v)}</button>`).join(" ")}</div>`;
+}
+document.addEventListener("click", (e)=>{
+  const btn = e.target.closest(".chipbtn");
+  if(btn){
+    const val = btn.getAttribute("data-val");
+    qs("#userInput").value = val;
+    qs("#inputForm").dispatchEvent(new Event("submit", {cancelable:true, bubbles:true}));
+  }
+});
+
+// ---------- Empathische feedback & parsing ----------
+function ack(field, raw){
+  const v = (raw||"").trim();
+  switch(field){
+    case "geslacht":
+      return v.startsWith("v") ? "Fijn, ik noteer <strong>vrouw</strong>. Dan let ik extra op pasvormen en proporties die vaak mooi vallen."
+                               : "Helder, <strong>man</strong>. Ik houd rekening met pasvormen en verhoudingen die meestal goed werken.";
+    case "leeftijd_lengte":
+      return "Top, daar kan ik rekening mee houden bij de lengte van broeken, mouwlengtes en silhouet.";
+    case "land":
+      return `Dank! Ik zoek dan vooral in winkels die leveren in <strong>${escapeHtml(v.toUpperCase())}</strong>.`;
+    case "gelegenheid":
+      return "Helder — dat geeft richting aan materialen en formaliteit.";
+    case "gevoel":
+      return `Snap ik. We gaan voor items die dat gevoel oproepen — zonder gedoe.`;
+    case "voorkeuren":
+      return "Dank! Ik neem je lievelingskleuren en ‘liever niets’ direct mee.";
+    case "praktisch":
+      return "Handig om te weten. Ik selecteer dingen die daar bij passen (comfort, onderhoud, weer).";
+    case "budget":
+      return `Prima. Met € ${fmt(Number(v)||state.answers.budget_total)} kan ik 2–3 outfits samenstellen met degelijke kwaliteit.`;
+    case "maten":
+      return v.toLowerCase()==="skip" ? "Geen probleem — ik kies items met brede maatbeschikbaarheid."
+                                      : "Top, ik houd die maten aan waar mogelijk.";
+    default: return "";
   }
 }
 
-function parseInput(text){
-  const t = text.trim();
-  if(!t) return;
-  if(state.pendingConfirm){
-    if(/^j(a|aa)?$/i.test(t)) return generateOutfits();
-    addBubble("Helder — pas gerust aan wat je wilt. Zeg <strong>ja</strong> zodra je klaar bent.");
-    return;
+function pickStylesFromText(txt){
+  const s = txt.toLowerCase();
+  const candidates = ["minimalistisch","casual","klassiek","sportief","creatief","smart","modern","stoer","vrouwelijk","zakelijk"];
+  const hit = candidates.filter(c => s.includes(c));
+  const map = {smart:"klassiek", modern:"minimalistisch", stoer:"sportief", zakelijk:"klassiek"};
+  return [...new Set(hit.map(x => map[x] || x))]
+    .filter(x => ["minimalistisch","casual","klassiek","sportief","creatief"].includes(x))
+    .slice(0,2);
+}
+
+function pickColorsFromText(txt){
+  const s = txt.toLowerCase();
+  const colors = ["zwart","wit","navy","blauw","denim","grijs","grey","olijf","olive","groen","beige","bruin","camel","steen","stone"];
+  return colors.filter(c => s.includes(c))
+               .slice(0,3)
+               .map(c => c.replace("grey","grijs").replace("olive","olijf"));
+}
+function pickAccessibility(txt){
+  const s = txt.toLowerCase();
+  const out = {};
+  if(s.includes("elast") || s.includes("stretch")) out.elastic_waist = true;
+  if(s.includes("sluiting") || s.includes("rits") || s.includes("makkelijk")) out.easy_closures = true;
+  if(s.includes("zacht") || s.includes("comfort")) out.soft_fabrics = true;
+  if(s.includes("instap") || s.includes("geen veters")) out.pull_on = true;
+  return out;
+}
+function needsExamples(txt){
+  const s = txt.toLowerCase();
+  return s.includes("weet niet") || s.includes("geen idee") || s.includes("maakt niet uit") || s === "?" || s === "";
+}
+function suggestExamplesFor(step){
+  switch(step){
+    case 3: return chipButtons(["werk","dagelijks","date","bruiloft","feest","vrijetijd"]);
+    case 4: return chipButtons(["zeker","rustig","stoer","creatief","minimalistisch","verzorgd"]);
+    case 5: return chipButtons(["zwart","navy","wit","olijf","linnen","katoen","wol (liever niet)","geen print"]);
+    case 7: return chipButtons(["150","250","400"]);
+    default: return "";
   }
-  const s = state.step;
-  addUser(text);
-
-  switch(s){
-    case 1: parseGeneral(t); break;
-    case 2: state.notes.occasion = t; state.intake.purpose = t.toLowerCase(); break;
-    case 3: state.notes.feeling = t; break;
-    case 4: parsePrefs(t); break;
-    case 5: state.notes.practical = t; parseAccessibility(t); break;
-    case 6: parseExtra(t); break;
-  }
-  state.step++;
-  if(state.step===7) summarizeAndConfirm(); else ask();
 }
 
-function parseGeneral(t){
-  const lower = t.toLowerCase();
-  if(/\b(vrouw|female)\b/.test(lower)) state.intake.gender = "female";
-  else if(/\b(man|male)\b/.test(lower)) state.intake.gender = "male";
-  else state.intake.gender = "unisex";
+// ---------- Intake flow ----------
+const QUESTIONS = [
+  () => `Laten we beginnen. Ben je <strong>man</strong> of <strong>vrouw</strong>? ${chipButtons(["man","vrouw"])}`,
+  () => `Dank! Hoe oud ben je? En wat is je <em>lengte</em> (cm)? <span class="small">Globaal antwoord is ook prima.</span>`,
+  () => `In welk land/regio bestel je? (bijv. NL, BE, DE, FR).`,
+  () => `Voor welke <strong>gelegenheid</strong> zoek je kledingadvies? (werk, dagelijks, event, vrije tijd) ${suggestExamplesFor(3)}`,
+  () => `Hoe wil je dat je kleding je laat <strong>voelen</strong>? ${suggestExamplesFor(4)}`,
+  () => `Vertel je <strong>voorkeuren</strong>: kleuren/materialen/silhouet die je fijn vindt of juist vermijdt. ${suggestExamplesFor(5)}`,
+  () => `Praktisch: leefstijl & <strong>eisen</strong> (mobiliteit, kreukarm, wasbaar, weer, representatief, etc.).`,
+  () => `Budget? Typ één <strong>totaalbedrag</strong> in euro's (bijv. 250). ${suggestExamplesFor(7)}`,
+  () => `Optioneel: <strong>maten</strong> (confectie/schoen) die ik moet aanhouden? Of typ <em>skip</em>.`
+];
 
-  const age = (t.match(/\b(\d{2})\b/)||[])[1];
-  if(age){
-    const a = parseInt(age,10);
-    state.intake.age_range = a<=25 ? "18–25" : a<=35 ? "26–35" : a<=45 ? "36–45" : a<=55 ? "46–55" : "56+";
-  }
-  if(/\bnl|nederland\b/.test(lower)) state.intake.country="NL";
-  else if(/\bbe|belgi(ë|e)\b/.test(lower)) state.intake.country="BE";
-
-  const sizes = {};
-  const broek = lower.match(/broek\w*\D+(\d{2,3}(?:\/\d{2})?)/); if(broek) sizes.bottom = broek[1];
-  const boven = lower.match(/boven\w*\D+\b(xs|s|m|l|xl|xxl)\b/); if(boven) sizes.top = boven[1].toUpperCase();
-  const schoen = lower.match(/schoen\w*\D+(\d{2,3})/); if(schoen) sizes.shoes = schoen[1];
-  if(Object.keys(sizes).length) state.intake.sizes = sizes;
+function startIntake(){
+  state.step = 0;
+  clearChat();
+  const hello = greeting();
+  addBubble(`${hello} Ik stel je een paar korte vragen. Antwoord gewoon in je eigen woorden — ik vat alles samen en maak dan de voorstellen.`, "anna");
+  askNext();
 }
-
-function parsePrefs(t){
-  state.notes.prefs = t;
-  const colors = [];
-  const colorWords = ["navy","blauw","denim","zwart","wit","grijs","groen","olijf","beige","bruin","taupe","bordeaux"];
-  colorWords.forEach(c => { if(new RegExp(`\\b${c}\\b`,'i').test(t)) colors.push(c); });
-  if(colors.length) state.intake.favorite_colors = Array.from(new Set(colors)).slice(0,4);
-
-  if(/\b(slank|slim|getailleerd)\b/i.test(t)) state.intake.fit = "getailleerd";
-  else if(/\b(relaxed|wijd|los)\b/i.test(t)) state.intake.fit = "relaxed";
-  else if(/\b(recht|regular)\b/i.test(t)) state.intake.fit = "recht";
-
-  const avoid = [];
-  if(/\bwol\b/i.test(t)) avoid.push("wol");
-  if(/\blatex\b/i.test(t)) avoid.push("latex");
-  if(/\bpolyester\b/i.test(t)) avoid.push("polyester");
-  if(avoid.length) state.intake.materials_avoid = avoid;
-}
-
-function parseAccessibility(t){
-  const flags = {
-    "elastic waist":"elastic_waist","elastische taille":"elastic_waist",
-    "easy closures":"easy_closures","makkelijke sluit":"easy_closures",
-    "soft fabrics":"soft_fabrics","zachte stof":"soft_fabrics",
-    "pull-on":"pull_on","pull on":"pull_on"
-  };
-  Object.entries(flags).forEach(([k,v])=>{ if(t.toLowerCase().includes(k)) state.intake.accessibility[v]=true; });
-}
-
-function parseExtra(t){
-  state.notes.extra = t;
-  const euros = t.match(/(\d+[.,]?\d*)/g);
-  if(euros && euros.length){
-    const val = parseFloat(euros[0].replace(",", "."));
-    if(/per\s*item/i.test(t)) state.intake.budget_per_item = val;
-    else state.intake.budget_total = val;
-  }
-  if(/\bslim\b/i.test(t)) state.intake.fit = "getailleerd";
-  if(/\brelaxed|los\b/i.test(t)) state.intake.fit = "relaxed";
-  if(/\bsmart[- ]?casual|business casual|zakelijk\b/i.test(t)) state.intake.purpose = "smart-casual";
-}
-
-function summarizeAndConfirm(){
-  if(!state.intake.styles.length){
-    const guess = ["casual"]; state.intake.styles = guess;
-  }
-  const bullets = [
-    `Doel/gelegenheid: <strong>${escapeHtml(state.intake.purpose || state.notes.occasion || "dagelijks")}</strong>`,
-    `Smaak & pasvorm: <strong>${escapeHtml((state.intake.styles||[]).join(", ")||"casual")}</strong> • ${escapeHtml(state.intake.fit||"recht")}`,
-    `Land & budget: <strong>${escapeHtml(state.intake.country)}</strong> • ${fmt€(state.intake.budget_total||250)}`,
-    state.intake.favorite_colors?.length ? `Kleuren: ${state.intake.favorite_colors.slice(0,3).join(", ")}` : null
-  ].filter(Boolean);
-  addBubble(`Samenvatting:<br>• ${bullets.join("<br>• ")}`);
-  state.pendingConfirm = true;
-  addBubble("Zal ik 2–3 outfits zoeken die je direct online kunt bestellen? Antwoord met <strong>ja</strong>.");
-}
-
-async function generateOutfits(){
-  state.pendingConfirm = false;
-  addBubble("Top — ik ga voor je aan de slag ✅ Een momentje…");
+function greeting(){
   try{
-    const res = await fetch(state.apiBase + "/api/generate", {
-      method: "POST",
-      headers: {"Content-Type":"application/json"},
+    const h = new Date().getHours();
+    if(h < 12) return "Goedemorgen!";
+    if(h < 18) return "Goedemiddag!";
+    return "Goedenavond!";
+  }catch{ return "Hoi!"; }
+}
+
+function askNext(){
+  if(state.step >= 0 && state.step < QUESTIONS.length){
+    addBubble(QUESTIONS[state.step]());
+  } else if (state.step === QUESTIONS.length){
+    summaryAndConfirm();
+  }
+}
+
+function handleAnswer(textRaw){
+  const t = textRaw.trim();
+  if(!t) return;
+  addUser(t);
+  state.history.push({role:"user", content:t});
+
+  switch(state.step){
+    case 0:{
+      const v = t.toLowerCase();
+      state.answers.geslacht = /vrouw|v|female|f/.test(v) ? "vrouw" : "man";
+      addBubble(ack("geslacht", v));
+      state.step++; break;
+    }
+    case 1:{
+      // probeer leeftijd + lengte
+      const nums = t.match(/\d+/g) || [];
+      if(nums.length) {
+        state.answers.leeftijd = nums[0];
+        if(nums[1]) state.answers.lengte = nums[1];
+      } else {
+        state.answers.leeftijd = t;
+      }
+      addBubble(ack("leeftijd_lengte", t));
+      state.step++; break;
+    }
+    case 2:{
+      state.answers.land = t.slice(0,2).toUpperCase();
+      addBubble(ack("land", state.answers.land));
+      state.step++; break;
+    }
+    case 3:{
+      if(needsExamples(t)){
+        addBubble(`Geen zorgen — kies er gerust één uit: ${suggestExamplesFor(3)}`);
+        return; // opnieuw zelfde stap
+      }
+      state.answers.gelegenheid = t;
+      addBubble(ack("gelegenheid", t));
+      state.step++; break;
+    }
+    case 4:{
+      if(needsExamples(t)){
+        addBubble(`Wat lijkt je fijn qua gevoel? Bijvoorbeeld: ${suggestExamplesFor(4)}`);
+        return;
+      }
+      state.answers.gevoel = t;
+      // stijlafleiding
+      state.answers.styles = pickStylesFromText(t);
+      addBubble(ack("gevoel", t));
+      state.step++; break;
+    }
+    case 5:{
+      if(needsExamples(t)){
+        addBubble(`Geen punt — kies gerust een paar: ${suggestExamplesFor(5)}`);
+        return;
+      }
+      state.answers.voorkeuren = t;
+      state.answers.styles = [...new Set([...state.answers.styles, ...pickStylesFromText(t)])].slice(0,2);
+      addBubble(ack("voorkeuren", t));
+      state.step++; break;
+    }
+    case 6:{
+      state.answers.praktisch = t;
+      addBubble(ack("praktisch", t));
+      state.step++; break;
+    }
+    case 7:{
+      if(needsExamples(t)){
+        addBubble(`Zeg maar een globaal bedrag (vb. 150, 250 of 400). ${suggestExamplesFor(7)}`);
+        return;
+      }
+      const n = parseFloat(t.replace(",", "."));
+      if(!isNaN(n) && n>0) state.answers.budget_total = n;
+      addBubble(ack("budget", String(state.answers.budget_total)));
+      state.step++; break;
+    }
+    case 8:{
+      if(t.toLowerCase()!=="skip") state.answers.maten = t;
+      addBubble(ack("maten", t));
+      state.step++; break;
+    }
+  }
+
+  askNext();
+}
+
+function summaryAndConfirm(){
+  const a = state.answers;
+  const bullets = [
+    `• Geslacht: ${a.geslacht || "—"}`,
+    `• Leeftijd/lengte: ${a.leeftijd || "—"} / ${a.lengte || "—"} • Land: ${a.land}`,
+    `• Gelegenheid: ${a.gelegenheid || "—"} • Gevoel: ${a.gevoel || "—"}`,
+    `• Voorkeuren: ${a.voorkeuren || "—"}`,
+    `• Praktisch: ${a.praktisch || "—"}`,
+    `• Budget totaal: € ${fmt(a.budget_total)} • Stijl(en): ${(a.styles||[]).join(", ")||"—"}`,
+    a.maten ? `• Maten: ${a.maten}` : null
+  ].filter(Boolean).join("<br>");
+
+  addBubble(`<div class="panel sum"><strong>Samenvatting</strong><br>${bullets}</div>`);
+  addBubble(`Klaar voor 2–3 concrete outfits? Typ <strong>ja</strong> om te starten.`, "anna");
+
+  state.step++; // wacht op "ja"
+}
+
+function maybeGenerate(text){
+  if(state.step === QUESTIONS.length+1){
+    const v = text.trim().toLowerCase();
+    if(v.startsWith("j")){
+      generateOutfits();
+      return true;
+    }else{
+      addBubble(`Geen probleem. Zeg het maar wanneer je klaar bent met <strong>ja</strong>.`, "anna");
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------- Generate ----------
+async function generateOutfits(){
+  addBubble(`Top — ik ga voor je aan de slag ✅ Een momentje…`, "anna");
+
+  const a = state.answers;
+  const intake = {
+    purpose: a.gelegenheid || "dagelijks",
+    styles: (a.styles && a.styles.length) ? a.styles.slice(0,2) : ["casual"],
+    gender: a.geslacht === "vrouw" ? "female" : "male",
+    fit: "",
+    age_range: a.leeftijd ? String(a.leeftijd) : "",
+    country: (a.land || "NL").toUpperCase(),
+    currency: "EUR",
+    budget_total: a.budget_total || 250,
+    budget_per_item: null,
+    sizes: a.maten ? { raw: a.maten } : null,
+    favorite_colors: pickColorsFromText((a.voorkeuren||"") + " " + (a.gevoel||"")),
+    materials_avoid: [],
+    accessibility: pickAccessibility(a.praktisch || ""),
+    sustainability_preference: false
+  };
+
+  try{
+    const res = await fetch(state.apiBase.replace(/\/+$/,"") + "/api/generate", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
       body: JSON.stringify({
-        intake: state.intake,
+        intake,
         mode: "serpapi",
         serpapi_api_key: null,
         outfits_count: 3
       })
     });
     if(!res.ok){
-      const err = await res.json().catch(()=>({detail: res.statusText}));
-      throw new Error(err.detail || "Onbekende fout");
+      const e = await res.json().catch(()=>({detail:res.statusText}));
+      throw new Error(e.detail || "Onbekende fout");
     }
     const data = await res.json();
-    renderOutfitsAsCards(data);
-  }catch(e){
-    addBubble("Hm, dit lukt nu niet. Probeer later opnieuw of check je Instellingen.", "anna");
+    renderOutfits(data);
+  }catch(err){
+    addBubble(`Hm, dat lukt nu niet. Probeer later opnieuw of check je <strong>Instellingen</strong>.`, "anna");
   }
 }
 
-function renderOutfitsAsCards(data){
-  const badge = document.createElement("div");
-  badge.className = "outfits badge";
-  badge.textContent = "modus: live via SerpAPI";
-  qs("#chat").appendChild(badge);
+function renderOutfits(data){
+  const chat = qs("#chat");
 
-  (data.outfits||[]).slice(0,3).forEach((out, idx) => {
-    const items = (out.items||[]).map(sanitizeItem).filter(onlyDirectProduct);
-    const lines = items.map(it => {
-      const shop = shopDomain(it.link);
-      return [
-        `<strong>${escapeHtml(it.title)}</strong> (${escapeHtml(it.role)})`,
-        `${fmt€(it.price)} • ${escapeHtml(shop)} — <a href="${it.link}" target="_blank" rel="noopener">bekijk</a>`
-      ].join("<br>");
+  (data.outfits||[]).forEach((out, idx) => {
+    const card = document.createElement("div");
+    card.className = "card";
+
+    const h = document.createElement("h3");
+    h.textContent = `Outfit ${idx+1}`;
+    card.appendChild(h);
+
+    (out.items||[]).forEach(it => {
+      const row = document.createElement("div");
+      row.className = "item";
+      const img = document.createElement("img");
+      img.alt = it.title || "item";
+      img.src = it.image || "data:image/svg+xml;charset=utf-8," + encodeURIComponent(`<svg xmlns='http://www.w3.org/2000/svg' width='60' height='60'><rect width='100%' height='100%' fill='#0F1420'/></svg>`);
+      const col = document.createElement("div");
+
+      const t = document.createElement("div");
+      t.innerHTML = `<strong>${escapeHtml(it.title||"—")}</strong> <span class="label">(${it.category})</span>`;
+
+      const m = document.createElement("div");
+      m.className = "small";
+      const shop = it.merchant ? ` • ${escapeHtml(it.merchant)}` : "";
+      const url = it.link || "#";
+      m.innerHTML = `€ ${fmt(it.price)}${shop} — <a href="${url}" target="_blank" rel="noopener">bekijk</a>`;
+
+      col.appendChild(t); col.appendChild(m);
+      row.appendChild(img); row.appendChild(col);
+      card.appendChild(row);
     });
 
-    let total = items.reduce((acc, it)=> acc + (isFinite(it.price)? it.price:0), 0);
+    const tot = document.createElement("div");
+    tot.className = "total";
+    tot.innerHTML = `<span class="label">Totaal</span><strong>€ ${fmt(out.total||0)}</strong>`;
+    card.appendChild(tot);
 
-    const card = document.createElement("div"); card.className = "card";
-    card.innerHTML = `
-      <h3>Outfit ${idx+1}</h3>
-      ${lines.join("<br>")}
-      <div class="total"><span class="label">Totaal</span><strong>${fmt€(total)}</strong></div>
-    `;
-    qs("#chat").appendChild(card);
+    chat.appendChild(card);
   });
 
-  if(data.explanation) addBubble(`Waarom dit werkt: ${escapeHtml(data.explanation)}`);
-  if(data.palette?.colors?.length){
-    addBubble(`Palet: ${data.palette.colors.slice(0,3).join(", ")}${data.palette.colors[3] ? " + " + data.palette.colors[3] : ""}.`);
-  }
-  addBubble("Onthoud: ik ben onafhankelijk — geen affiliate of commissies.");
-  addBubble("Wil je meer alternatieven zien (goedkoper/duurzamer/chiquer), of zal ik hier een <strong>complete shoppinglijst</strong> met maatadvies van maken? Wil je een <em>veiligere</em> optie of juist iets <em>gedurfder</em>?");
+  if(data.explanation) addBubble(`Waarom dit werkt: ${escapeHtml(data.explanation)}`, "anna");
+  if(data.palette?.colors?.length) addBubble(`Palet: ${data.palette.colors.slice(0,4).join(", ")}.`, "anna");
+  addBubble(`Onthoud: ik ben onafhankelijk — geen affiliate of commissies.`, "anna");
+
+  // afsluiter
+  addBubble(`Wil je meer alternatieven zien (goedkoper/duurzamer/chiquer), of zal ik hier een <strong>complete shoppinglijst</strong> met maatadvies van maken?`, "anna");
 }
 
-function sanitizeItem(raw){
-  if(!raw) return null;
-  const role = raw.category || raw.role || "accessory";
-  let url = (raw.link || "").trim();
-  if(!url) return null;
+// ---------- Utils ----------
+function fmt(n){
   try{
-    const u = new URL(url);
-    const bad = ["utm_source","utm_medium","utm_campaign","utm_content","gclid","fbclid","msclkid","aff","affid","cjevent","irclickid","irgwc","_ga","_gl"];
-    bad.forEach(k=>u.searchParams.delete(k));
-    url = u.origin + u.pathname + (u.searchParams.toString()? "?"+u.searchParams.toString() : "");
-  }catch(e){}
-  return { role, title: raw.title||"—", price: toNumber(raw.price), link:url, image: raw.image||null };
+    return new Intl.NumberFormat("nl-NL",{minimumFractionDigits:2, maximumFractionDigits:2}).format(Number(n||0));
+  }catch{ return String(n) }
 }
-function onlyDirectProduct(it){
-  if(!it || !it.link) return false;
-  try{
-    const u = new URL(it.link);
-    const host = u.hostname;
-    if(/google\.com|shopping\.google|googleadservices|doubleclick/i.test(host)) return false;
-    if(u.pathname === "/" || u.pathname.split("/").filter(Boolean).length < 1) return false;
-    return true;
-  }catch(e){ return false; }
+function escapeHtml(str){
+  return String(str).replace(/[&<>"']/g, m => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[m]));
 }
-function shopDomain(url){
-  try{
-    const u = new URL(url);
-    const host = u.hostname.replace(/^www\./,"");
-    const seg0 = u.pathname.split("/").filter(Boolean)[0] || "";
-    if(["nl","be"].includes(seg0.toLowerCase())) return `${host}/${seg0.toLowerCase()}`;
-    return host;
-  }catch(e){ return "shop"; }
-}
-function toNumber(v){ if(typeof v==="number") return v; const n = parseFloat(String(v||"").replace(",", ".")); return isNaN(n)?0:n; }
-function fmt€(n){ try{ return new Intl.NumberFormat("nl-NL",{style:"currency",currency:"EUR"}).format(n||0); }catch(e){ return `€ ${Number(n||0).toFixed(2).replace(".",",")}`; } }
 
-qs("#inputForm").addEventListener("submit",(e)=>{ e.preventDefault(); const val = qs("#userInput").value; if(!val.trim())return; qs("#userInput").value=""; parseInput(val); });
-const modal = qs("#settingsModal");
-qs("#settingsBtn").addEventListener("click", ()=>{ modal.classList.remove("hidden"); qs("#apiBase").value = state.apiBase; });
-qs("#closeSettings").addEventListener("click", ()=> modal.classList.add("hidden"));
-qs("#saveSettings").addEventListener("click", ()=>{ state.apiBase = qs("#apiBase").value || state.apiBase; localStorage.setItem("apiBase", state.apiBase); modal.classList.add("hidden"); addBubble("Instellingen opgeslagen ✅"); });
+// ---------- Settings ----------
+const modal = qs("#settings");
+qs("#btnSettings").addEventListener("click", ()=> {
+  qs("#apiBase").value = state.apiBase;
+  modal.classList.add("show");
+});
+qs("#closeSettings").addEventListener("click", ()=> modal.classList.remove("show"));
+qs("#saveSettings").addEventListener("click", ()=> {
+  state.apiBase = qs("#apiBase").value || state.apiBase;
+  localStorage.setItem("apiBase", state.apiBase);
+  modal.classList.remove("show");
+  addBubble("Instellingen opgeslagen ✅", "anna");
+});
 
-ask();
+// ---------- Input & start ----------
+qs("#btnStart").addEventListener("click", startIntake);
+
+qs("#inputForm").addEventListener("submit", (e)=>{
+  e.preventDefault();
+  const val = qs("#userInput").value;
+  if(!val.trim()) return;
+  if(maybeGenerate(val)) { qs("#userInput").value=""; return; }
+  handleAnswer(val);
+  qs("#userInput").value="";
+});
+
+startIntake(); // automatisch starten
